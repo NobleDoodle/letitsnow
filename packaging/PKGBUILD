@@ -1,0 +1,34 @@
+# Maintainer: NobleDoodle <nobledoodle@users.noreply.github.com>
+#
+# Builds from the checkout this file sits in, not from a downloaded tarball:
+# `cd packaging && makepkg -si` by hand, or the Omarchy panel's Install
+# (bin/letitsnow-setup). Either way the service installed is built from the tree
+# you already have -- and, for a published listing, from the exact commit that
+# was reviewed. The checkout is only read: everything the build makes goes to $srcdir
+# (make O=...), never into the plugin folder the Omarchy shell watches.
+pkgname=letitsnow
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Falling snow on the Hyprland desktop, as a user service"
+arch=('x86_64' 'aarch64')
+url="https://github.com/NobleDoodle/letitsnow"
+license=('MIT')
+depends=('wayland' 'libglvnd' 'bash' 'util-linux')
+makedepends=('wayland-protocols')
+optdepends=('hyprland: restacking above wallpapers and pausing behind fullscreen windows (other layer-shell compositors just snow)')
+source=()
+sha256sums=()
+
+build() {
+  make -C "$startdir/.." O="$srcdir/build"
+}
+
+check() {
+  make -C "$startdir/.." O="$srcdir/build" check
+}
+
+package() {
+  # Only the service. The QML beside it is the bar widget, which Omarchy loads
+  # from the checkout and which pacman has no business owning.
+  make -C "$startdir/.." O="$srcdir/build" install DESTDIR="$pkgdir" PREFIX=/usr
+}

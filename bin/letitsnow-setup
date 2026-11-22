@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# letitsnow-setup [--build-only DIR]: build letitsnow, the snow service, from this
+# plugin's own checkout and install it with pacman.
+#
+# The Let It Snow panel runs this in Omarchy's presented terminal: it asks
+# questions and pacman asks for a password, and neither has anywhere to happen
+# inside omarchy-shell. It is just as fine to run by hand.
+#
+#   --build-only DIR   build and check the package, copy it to DIR and stop:
+#                      no sudo, no pacman (the tests use this)
+#
+# Built on Omarchroma's setup (NobleDoodle/omarchroma, bin/hyprchroma-setup):
+# the same trusted PATH, build sandbox and package check.
+set -uo pipefail
+
+# Commands resolve from a fixed, verified set rather than the inherited PATH:
+# directories owned by root and writable by nobody else. ~/.local/bin is never
+# in it, so an older `make install-user` copy cannot stand in for anything here.
+trusted_path() {
+  local directory owner mode trusted="" unmapped="" overflow inside count
+  if [[ -r /proc/self/uid_map ]] && overflow=$(</proc/sys/kernel/overflowuid); then
+    unmapped=$overflow
+    while read -r inside _ count; do
+      (( overflow >= inside && overflow < inside + count )) && unmapped=""
+    done < /proc/self/uid_map
+  fi
+  for directory in /usr/bin /usr/share/omarchy/bin; do
+    [[ -d $directory ]] || continue
+    read -r owner mode < <(/usr/bin/stat -Lc '%u %a' "$directory" 2>/dev/null) || continue
+    [[ $owner == 0 || ( -n $unmapped && $owner == "$unmapped" ) ]] || continue
+    (( (8#$mode & 8#022) == 0 )) || continue
+    trusted="${trusted:+$trusted:}$directory"
+  done
+  printf '%s' "${trusted:-/usr/bin:/usr/share/omarchy/bin}"
+}
+PATH=$(trusted_path)
+export PATH
+
+here=$(cd -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")/.." && pwd)
+build_only=""
+if [[ ${1:-} == --build-only ]]; then
+  build_only=${2:-}
+  [[ -n $build_only ]] || { echo "--build-only needs a directory"; exit 2; }
+fi
+
+bold=$'\033[1m'; dim=$'\033[2m'; reset=$'\033[0m'
+say()   { printf '%s\n' "$*"; }
+head2() { printf '\n%s%s%s\n' "$bold" "$*" "$reset"; }
+note()  { printf '%s%s%s\n' "$dim" "$*" "$reset"; }
+
+# Default no, unless a second argument of "yes" makes return mean yes.
+ask() {
+  local prompt=$1 default=${2:-no} answer
+  if [[ $default == yes ]]; then
+    read -r -p "$prompt [Y/n]: " answer
+    [[ ${answer,,} != n && ${answer,,} != no ]]
+  else
+    read -r -p "$prompt [y/N]: " answer
+    [[ ${answer,,} == y || ${answer,,} == yes ]]
+  fi
+}
+
+# The password is asked for before the build, and sudo's ticket is kept fresh
+# from then on, so pacman at the end does not prompt cold after a quiet build.
+# The build itself cannot use the ticket: see in_sandbox.
+keepalive_pid=""
+start_sudo_keepalive() {
+  [[ -n $keepalive_pid ]] && return 0
+  local script_pid=$$
+  ( while kill -0 "$script_pid" 2>/dev/null; do sleep 60; sudo -n true 2>/dev/null; done ) >/dev/null 2>&1 &
+  keepalive_pid=$!
+}
+run_sudo() { sudo "$@" && start_sudo_keepalive; }
+
+# One fresh build directory under the user's cache: not /tmp, which every user
+# shares, and not the plugin folder, which the Omarchy shell watches (a build
+# writing there reloads the panel's QML mid-build).
+build_cache="${XDG_CACHE_HOME:-$HOME/.cache}/letitsnow-setup"
+work_dirs=()
+finish() {
+  local dir
+  for dir in "${work_dirs[@]}"; do rm -rf -- "$dir"; done
+  [[ -n $keepalive_pid ]] && kill "$keepalive_pid" 2>/dev/null
+  [[ -z $build_only ]] && sudo -k 2>/dev/null
+  return 0
+}
+trap finish EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+new_work_dir() {
+  mkdir -p -- "$build_cache" || return 1
+  work_dir=$(mktemp -d -p "$build_cache") || return 1
+  work_dirs+=("$work_dir")
+  mkdir -- "$work_dir/build" "$work_dir/out" "$work_dir/sources"
+}
+
+sandbox_works() {
+  [[ -x /usr/bin/bwrap ]] &&
+    bwrap --ro-bind / / --unshare-all --new-session --die-with-parent \
+      -- /usr/bin/true >/dev/null 2>&1
+}
+
+# in_sandbox WORK DIR COMMAND...: COMMAND runs in DIR, offline, with no new
+# privileges (setuid sudo cannot become root, ticket or not), in a session of
+# its own, with the system read-only, /home, /run and /tmp empty, a clean
+# environment -- and this checkout read-only, so the build provably writes
+# nothing into the plugin. Only WORK is writable.
+in_sandbox() {
+  local work=$1 dir=$2 hide=(--tmpfs /home)
+  shift 2
+  [[ $HOME == /?* && $HOME != /home/* ]] && hide+=(--tmpfs "$HOME")
+  bwrap --ro-bind / / --dev /dev --proc /proc \
+    --tmpfs /tmp --tmpfs /var/tmp --tmpfs /run "${hide[@]}" \
+    --ro-bind "$here" "$here" --bind "$work" "$work" --chdir "$dir" \
+    --unshare-all --new-session --die-with-parent --cap-drop ALL \
+    --clearenv --setenv PATH /usr/bin --setenv HOME "$work" --setenv LANG C.UTF-8 \
+    --setenv XDG_CONFIG_HOME "$here/packaging/sandbox" \
+    --setenv BUILDDIR "$work/build" --setenv PKGDEST "$work/out" \
+    --setenv SRCDEST "$work/sources" --setenv SRCPKGDEST "$work/out" \
+    --setenv LOGDEST "$work/build" --setenv FAKEROOTDONTTRYCHOWN 1 \
+    -- "$@" </dev/null
+}
+# What a build prints, with control characters taken out: a terminal acts on them.
+shown() {
+  "$@" 2>&1 | LC_ALL=C sed -u -e 's/\xc2[\x80-\x9f]//g' \
+                              -e 's/[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]//g'
+  return "${PIPESTATUS[0]}"
+}
+
+BUILD_NEEDS=(base-devel wayland wayland-protocols libglvnd)
+missing_tools() { pacman -T -- "$@" 2>/dev/null | paste -sd' ' -; }
+
+pkgver=$(sed -n 's/^pkgver=//p' "$here/packaging/PKGBUILD")
+pkgrel=$(sed -n 's/^pkgrel=//p' "$here/packaging/PKGBUILD")
+version="$pkgver-$pkgrel"
+
+# The one package makepkg made, not a -debug one beside it. Sets built_package.
+find_built() {
+  local file found=()
+  for file in "$work_dir/out/letitsnow"-*.pkg.tar.*; do
+    [[ -f $file && ! -L $file && ${file##*/} != letitsnow-debug-* ]] && found+=("$file")
+  done
+  (( ${#found[@]} == 1 )) || return 1
+  built_package=${found[0]}
+}
+
+# packaging/check-package reads the package as pacman will and refuses anything
+# outside letitsnow's own paths, any install script, setuid file and so on.
+check_built() {
+  local check=(/usr/bin/python3 -I "$here/packaging/check-package" "$built_package"
+    --name letitsnow --version "$version"
+    --root usr/bin/letitsnow --root usr/lib/letitsnow --root usr/lib/systemd/user/letitsnow.service
+    --root usr/share/doc/letitsnow --root usr/share/licenses/letitsnow)
+  if sandbox_works; then shown in_sandbox "$work_dir" "$work_dir" "${check[@]}"
+  else shown "${check[@]}"
+  fi
+}
+
+build_package() {
+  new_work_dir || { say "Could not create a build directory."; return 1; }
+  if sandbox_works; then
+    shown in_sandbox "$work_dir" "$here/packaging" makepkg --nocolor --noconfirm
+  else
+    ( cd "$here/packaging" &&
+      shown setsid -w env -i PATH=/usr/bin HOME="$work_dir" LANG=C.UTF-8 \
+        XDG_CONFIG_HOME="$here/packaging/sandbox" BUILDDIR="$work_dir/build" \
+        PKGDEST="$work_dir/out" SRCDEST="$work_dir/sources" LOGDEST="$work_dir/build" \
+        setpriv --no-new-privs -- makepkg --nocolor --noconfirm </dev/null )
+  fi || { say "The build did not finish."; return 1; }
+  find_built || { say "The build did not leave exactly one letitsnow package."; return 1; }
+  check_built || { say "The package is not what this checkout builds."; return 1; }
+}
+
+# --- build only ---------------------------------------------------------------
+if [[ -n $build_only ]]; then
+  missing=$(missing_tools "${BUILD_NEEDS[@]}")
+  [[ -z $missing ]] || { say "Missing build tools: $missing"; exit 1; }
+  build_package || exit 1
+  mkdir -p -- "$build_only" && cp -- "$built_package" "$build_only/" || exit 1
+  say "Built and checked: $build_only/${built_package##*/}"
+  exit 0
+fi
+
+# --- interactive install --------------------------------------------------------
+# The first screen has to fit Omarchy's floating terminal below its logo.
+installed=$(pacman -Q letitsnow 2>/dev/null | awk '{print $2}')
+printf '%sLet It Snow setup%s\n' "$bold" "$reset"
+cat <<INTRO
+This installs letitsnow $version, the user service that draws the snow,
+built from this plugin's own folder. pacman installs it, so it can be
+listed, upgraded and removed like any other package. Nothing is downloaded
+unless a build tool is missing, and that asks first.
+INTRO
+[[ -n $installed ]] && note "Installed now: letitsnow $installed."
+say ""
+if ! ask "Build and install letitsnow $version" yes; then
+  say "Nothing was changed."
+  exit 0
+fi
+
+head2 "Build tools"
+missing=$(missing_tools "${BUILD_NEEDS[@]}")
+if [[ -n $missing ]]; then
+  say "The build needs these from the official repositories:"
+  say "  sudo pacman -S --needed --asdeps $missing"
+  read -r -a missing_list <<<"$missing"
+  run_sudo pacman -S --needed --asdeps -- "${missing_list[@]}" ||
+    { say "They were not installed, so nothing was built."; exit 1; }
+else
+  note "Everything the build needs is installed."
+fi
+if ! sandbox_works; then
+  pacman -T bubblewrap >/dev/null 2>&1 || run_sudo pacman -S --needed --asdeps bubblewrap
+  sandbox_works ||
+    note "bubblewrap cannot start here; the build runs with no new privileges and a clean environment instead."
+fi
+
+head2 "Building"
+say "sudo asks for your password now, for pacman at the end. The build cannot use it:"
+say "it runs offline in a sandbox, from this folder, which it can only read."
+run_sudo -v || { say "Could not authenticate; nothing was built."; exit 1; }
+build_package || { say "Nothing was installed."; exit 1; }
+run_sudo pacman -U --needed -- "$built_package" ||
+  { say "pacman did not install it; nothing else was changed."; exit 1; }
+pacman -Qq letitsnow &>/dev/null || { say "letitsnow is not installed; nothing else was changed."; exit 1; }
+
+head2 "Setting up"
+was_enabled=no
+[[ $(systemctl --user is-enabled letitsnow.service 2>/dev/null) == enabled ]] && was_enabled=yes
+was_running=no
+/usr/bin/letitsnow status --json 2>/dev/null | grep -q '"running":true' && was_running=yes
+
+# A copy from `make install-user` comes before the package twice over: on PATH,
+# and in systemd's unit search path (~/.local/share before /usr/lib).
+old=()
+for f in "$HOME/.local/bin/letitsnow" "$HOME/.local/share/systemd/user/letitsnow.service" "$HOME/.local/lib/letitsnow"; do
+  [[ -e $f ]] && old+=("$f")
+done
+if (( ${#old[@]} )); then
+  say "An earlier copy from 'make install-user' would be used instead of the package:"
+  printf '  %s\n' "${old[@]}"
+  if ask "Remove it" yes; then
+    [[ $was_running == yes ]] && /usr/bin/letitsnow stop >/dev/null 2>&1
+    systemctl --user disable letitsnow.service >/dev/null 2>&1
+    rm -rf -- "${old[@]}" "$HOME/.local/share/doc/letitsnow" "$HOME/.local/share/licenses/letitsnow"
+    note "Removed."
+  fi
+fi
+systemctl --user daemon-reload ||
+  note "Could not reload the user service manager; log out and in if the service misbehaves."
+
+# On an update, the new renderer replaces the running one; pacman restarts nothing.
+if [[ $was_enabled == yes ]]; then
+  systemctl --user reenable letitsnow.service >/dev/null 2>&1 ||
+    note "Could not re-enable letitsnow.service; the panel's Start with the session switch can."
+fi
+if [[ $was_running == yes ]]; then
+  /usr/bin/letitsnow restart
+elif ask "Start the snow now" yes; then
+  /usr/bin/letitsnow start
+fi
+if [[ $was_enabled == no ]] && ask "Start it with your session from now on"; then
+  /usr/bin/letitsnow enable
+fi
+
+head2 "Done"
+say "The panel picks the service up when this window closes; no shell restart needed."
+say "Try it from a terminal too: letitsnow help"
+say ""
+read -r -p "Press return to close this window. "

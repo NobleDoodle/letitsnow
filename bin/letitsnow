@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# letitsnow: falling snow on your Hyprland desktop.
+#
+# This command owns the settings file and starts and stops the renderer,
+# letitsnowd, as the systemd user service letitsnow.service (or directly when
+# there is no user manager). The renderer watches the settings file, so a
+# change applies to the snow already falling.
+#
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+
+VERSION="@VERSION@"
+LIBEXECDIR="@LIBEXECDIR@"
+UNIT=letitsnow.service
+
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+case $VERSION in @*) VERSION=$(cat "$here/../VERSION" 2>/dev/null || echo dev) ;; esac
+
+cfg_dir=${XDG_CONFIG_HOME:-$HOME/.config}/letitsnow
+cfg=$cfg_dir/config
+runtime=${XDG_RUNTIME_DIR:-/tmp}
+log_file=${XDG_STATE_HOME:-$HOME/.local/state}/letitsnow/letitsnow.log
+
+KEYS=(speed density opacity layer fps)
+declare -A DEFAULT=([speed]=1 [density]=1 [opacity]=1 [layer]=desktop [fps]=60)
+declare -A MIN=([speed]=0.1 [density]=0.1 [opacity]=0.05 [fps]=10)
+declare -A MAX=([speed]=5 [density]=5 [opacity]=1 [fps]=240)
+
+die() { echo "letitsnow: $*" >&2; exit 1; }
+
+usage() {
+	cat <<EOF
+letitsnow $VERSION: falling snow on your Hyprland desktop
+
+usage: letitsnow [command] [--key value ...]
+
+  letitsnow                  start the snow (same as: letitsnow start)
+  letitsnow start [--speed N] [--density N] [--opacity N] [--layer desktop|dynamic|top]
+  letitsnow stop             stop it
+  letitsnow toggle           start or stop it
+  letitsnow status [--json]  what is running, and the settings
+
+  letitsnow speed [N]        how fast it falls, ${MIN[speed]}-${MAX[speed]} (1 = as in the reel)
+  letitsnow density [N]      how many flakes, ${MIN[density]}-${MAX[density]} (1 = 240 per 1920x1080)
+  letitsnow opacity [N]      how bright they are, ${MIN[opacity]}-${MAX[opacity]}
+  letitsnow layer [desktop|dynamic|top]
+                             desktop: on the wallpaper, behind windows and widgets
+                             dynamic: on the wallpaper, and faintly (10%) over windows
+                             top:     above everything, windows and bar included
+  letitsnow set KEY=VALUE... several at once (keys: ${KEYS[*]})
+  letitsnow reset            back to the defaults
+
+  letitsnow enable           start with the session (systemd user service)
+  letitsnow disable          don't
+  letitsnow run [-v]         run the renderer in this terminal
+  letitsnow version
+
+Changes apply to snow that is already falling. Settings: $cfg
+EOF
+}
+
+# ------------------------------------------------------------------ settings
+
+declare -A VAL
+
+load() {
+	local k line key value
+	for k in "${KEYS[@]}"; do VAL[$k]=${DEFAULT[$k]}; done
+	[ -r "$cfg" ] || return 0
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=${line%%#*}
+		[[ $line == *=* ]] || continue
+		key=$(printf '%s' "${line%%=*}" | tr -d '[:space:]')
+		value=$(printf '%s' "${line#*=}" | tr -d '[:space:]')
+		[ -n "$key" ] && [ -n "${DEFAULT[$key]+x}" ] || continue
+		# A hand-edited value that does not check out keeps the default.
+		value=$(norm "$key" "$value" 2> /dev/null) && VAL[$key]=$value
+	done < "$cfg"
+	return 0
+}
+
+save() {
+	local tmp k
+	mkdir -p "$cfg_dir"
+	tmp=$(mktemp "$cfg_dir/.config.XXXXXX")
+	{
+		echo "# letitsnow settings. The snow picks up changes as soon as this file is saved."
+		for k in "${KEYS[@]}"; do echo "$k=${VAL[$k]}"; done
+	} > "$tmp"
+	mv -f "$tmp" "$cfg"
+}
+
+# norm KEY VALUE: the value as stored, or a reason on stderr.
+norm() {
+	local key=$1 value=$2
+	case $key in
+	layer)
+		case $value in
+		desktop | background | bottom | behind) echo desktop ;;
+		top | overlay | above) echo top ;;
+		dynamic) echo dynamic ;;
+		*) echo "letitsnow: layer is desktop, dynamic or top, not '$value'" >&2; return 1 ;;
+		esac
+		;;
+	speed | density | opacity | fps)
+		if ! [[ $value =~ ^[0-9]*\.?[0-9]+$ ]]; then echo "letitsnow: $key needs a number, not '$value'" >&2; return 1; fi
+		if [ "$key" = fps ] && ! [[ $value =~ ^[0-9]+$ ]]; then echo "letitsnow: fps is a whole number" >&2; return 1; fi
+		if ! awk -v v="$value" -v lo="${MIN[$key]}" -v hi="${MAX[$key]}" 'BEGIN { exit !(v + 0 >= lo + 0 && v + 0 <= hi + 0) }'; then
+			echo "letitsnow: $key goes from ${MIN[$key]} to ${MAX[$key]}" >&2; return 1
+		fi
+		awk -v v="$value" 'BEGIN { printf "%g\n", v + 0 }'
+		;;
+	*) echo "letitsnow: unknown setting '$key' (${KEYS[*]})" >&2; return 1 ;;
+	esac
+}
+
+put() {
+	local v
+	v=$(norm "$1" "$2") || exit 1
+	VAL[$1]=$v
+}
+
+# --speed 2 --layer=top ... ; returns how many arguments it used
+parse_flags() {
+	local n=0 key value
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--*=*) key=${1%%=*}; key=${key#--}; value=${1#*=}; shift; n=$((n + 1)) ;;
+		--*)
+			key=${1#--}
+			[ $# -ge 2 ] || die "--$key needs a value"
+			value=$2; shift 2; n=$((n + 2))
+			;;
+		*) die "unexpected '$1' (see letitsnow help)" ;;
+		esac
+		put "$key" "$value"
+	done
+}
+
+# ------------------------------------------------------------------ the renderer
+
+renderer() {
+	if [ -n "${LETITSNOWD:-}" ]; then
+		echo "$LETITSNOWD"
+	elif [ -x "$LIBEXECDIR/letitsnowd" ]; then
+		echo "$LIBEXECDIR/letitsnowd"
+	elif [ -x "$here/../build/letitsnowd" ]; then
+		echo "$here/../build/letitsnowd"
+	else
+		die "the renderer, letitsnowd, is not installed (run make in the source tree)"
+	fi
+}
+
+# The user manager is reachable and knows the unit.
+have_unit() {
+	[ -z "${LETITSNOW_NO_SYSTEMD:-}" ] &&
+		systemctl --user show-environment > /dev/null 2>&1 &&
+		[ -n "$(systemctl --user show -P FragmentPath "$UNIT" 2>/dev/null)" ]
+}
+
+unit_active() { have_unit && systemctl --user is-active --quiet "$UNIT"; }
+
+# PIDs of renderers holding their lock (one per Wayland display), however started.
+renderer_pids() {
+	local f pid
+	for f in "$runtime"/letitsnow-*.lock; do
+		[ -e "$f" ] || continue
+		if ! flock -n "$f" true 2> /dev/null; then
+			pid=$(tr -dc '0-9' < "$f")
+			[ -n "$pid" ] && echo "$pid"
+		fi
+	done
+}
+
+running() { unit_active || [ -n "$(renderer_pids)" ]; }
+
+wait_for() { # wait_for up|down
+	local i
+	for i in $(seq 1 30); do
+		if [ "$1" = up ]; then running && return 0; else running || return 0; fi
+		sleep 0.1
+	done
+	return 1
+}
+
+start() {
+	running && { summary; return 0; }
+	if have_unit; then
+		systemctl --user reset-failed "$UNIT" 2> /dev/null || true
+		systemctl --user start "$UNIT"
+	else
+		mkdir -p "$(dirname "$log_file")"
+		setsid -f "$(renderer)" >> "$log_file" 2>&1 < /dev/null
+	fi
+	if wait_for up; then
+		summary
+	elif have_unit; then
+		die "it did not start; see: journalctl --user -u $UNIT -n 20"
+	else
+		die "it did not start; see $log_file"
+	fi
+}
+
+stop() {
+	local pid
+	if unit_active; then systemctl --user stop "$UNIT"; fi
+	for pid in $(renderer_pids); do kill -TERM "$pid" 2> /dev/null || true; done
+	wait_for down || die "it is still running"
+	echo "letitsnow: stopped"
+}
+
+autostart() { have_unit && [ "$(systemctl --user is-enabled "$UNIT" 2>/dev/null)" = enabled ]; }
+
+summary() {
+	load
+	if running; then
+		printf 'letitsnow: snowing, speed %s, density %s, opacity %s, layer %s\n' \
+			"${VAL[speed]}" "${VAL[density]}" "${VAL[opacity]}" "${VAL[layer]}"
+	else
+		echo "letitsnow: stopped"
+	fi
+}
+
+status() {
+	load
+	local run=false how=none auto=false unit=false
+	if unit_active; then run=true how=systemd
+	elif [ -n "$(renderer_pids)" ]; then run=true how=direct
+	fi
+	have_unit && unit=true
+	autostart && auto=true
+	if [ "${1:-}" = --json ]; then
+		printf '{"version":"%s","running":%s,"service":"%s","unit":%s,"autostart":%s,"speed":%s,"density":%s,"opacity":%s,"layer":"%s","fps":%s}\n' \
+			"$VERSION" "$run" "$how" "$unit" "$auto" "${VAL[speed]}" "${VAL[density]}" "${VAL[opacity]}" "${VAL[layer]}" "${VAL[fps]}"
+		return
+	fi
+	if $run; then echo "letitsnow $VERSION: snowing ($([ $how = systemd ] && echo "user service" || echo "started directly"))"
+	else echo "letitsnow $VERSION: stopped"
+	fi
+	printf '  speed %s, density %s, opacity %s, layer %s, %s fps\n' \
+		"${VAL[speed]}" "${VAL[density]}" "${VAL[opacity]}" "${VAL[layer]}" "${VAL[fps]}"
+	if $unit; then echo "  start with the session: $($auto && echo yes || echo no)"
+	else echo "  no user service installed: started directly, not at login"
+	fi
+}
+
+# letitsnow speed [N] and friends
+one_setting() {
+	local key=$1
+	shift
+	load
+	if [ $# -eq 0 ]; then
+		echo "${VAL[$key]}"
+		return
+	fi
+	put "$key" "$1"
+	save
+	running && summary || echo "letitsnow: $key ${VAL[$key]} (applies when the snow starts)"
+}
+
+cmd=${1:-start}
+[ $# -gt 0 ] && shift
+case $cmd in
+--*) # letitsnow --speed 2: start with these
+	load
+	parse_flags "$cmd" "$@"
+	save
+	start
+	;;
+start)
+	load
+	if [ $# -gt 0 ]; then parse_flags "$@"; save; fi
+	start
+	;;
+stop) stop ;;
+restart) stop > /dev/null; start ;;
+toggle) if running; then stop; else start; fi ;;
+status) status "${1:-}" ;;
+speed | density | opacity | layer | fps) one_setting "$cmd" "$@" ;;
+set)
+	[ $# -gt 0 ] || die "set KEY=VALUE ..."
+	load
+	for kv in "$@"; do
+		[[ $kv == *=* ]] || die "set takes KEY=VALUE, not '$kv'"
+		put "${kv%%=*}" "${kv#*=}"
+	done
+	save
+	running && summary || true
+	;;
+reset)
+	rm -f "$cfg"
+	load
+	save
+	running && summary || echo "letitsnow: settings back to the defaults"
+	;;
+enable)
+	have_unit || die "the user service is not installed (letitsnow.service); add 'exec-once = letitsnow' to your Hyprland config instead"
+	systemctl --user enable --now "$UNIT"
+	if ! systemctl --user is-active --quiet graphical-session.target; then
+		echo "letitsnow: note: graphical-session.target is not active in this session, so systemd will not"
+		echo "  start the service at login on its own. Add 'exec-once = letitsnow' to your Hyprland config."
+	fi
+	summary
+	;;
+disable)
+	have_unit || die "the user service is not installed"
+	systemctl --user disable "$UNIT"
+	echo "letitsnow: will not start with the session (still running: $(running && echo yes || echo no))"
+	;;
+run) exec "$(renderer)" "$@" ;;
+version | --version | -V) echo "letitsnow $VERSION" ;;
+help | --help | -h) usage ;;
+*) die "unknown command '$cmd' (see letitsnow help)" ;;
+esac

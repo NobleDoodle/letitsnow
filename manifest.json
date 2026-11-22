@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.nobledoodle.letitsnow",
+  "name": "Let It Snow",
+  "version": "0.1.0",
+  "author": "NobleDoodle",
+  "license": "MIT",
+  "description": "Falling snow on your Hyprland desktop. A bar button and panel to start, stop and tune the snow (speed, density, brightness, and whether it falls behind your windows, faintly over them too, or above everything), plus letitsnow, the small user service that draws it, which the panel builds and installs from this same folder.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Let It Snow",
+    "description": "Start, stop and tune the letitsnow snow",
+    "category": "Appearance",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

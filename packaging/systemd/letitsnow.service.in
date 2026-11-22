@@ -1,0 +1,38 @@
+[Unit]
+Description=Let it snow: falling snow on the Hyprland desktop
+Documentation=https://github.com/NobleDoodle/letitsnow
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+# The renderer finds the session itself (WAYLAND_DISPLAY, or Hyprland's lock
+# file when the user manager was never given the session's environment).
+ExecStart=@LIBEXECDIR@/letitsnowd
+# Settings apply on their own when the file changes; this is for editors that
+# write somewhere inotify cannot see.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+# 69 (EX_UNAVAILABLE): no Wayland session or no layer-shell. Retrying will not
+# make one appear.
+RestartPreventExitStatus=69
+# Snow is decoration: it yields to everything else.
+Nice=10
+# Measured: 41 MB peak for the unit's cgroup, 2 MB of it private. The cap
+# leaves room for the GPU driver's libraries being charged here when this is
+# the first program to load them.
+MemoryMax=256M
+
+# It talks to the compositor and Hyprland's sockets and reads one settings
+# file; it needs no new privilege, no network and no realtime scheduling.
+# Nothing here needs a mount namespace, so it works under any user manager.
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=graphical-session.target

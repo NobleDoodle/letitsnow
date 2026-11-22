@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# letitsnow-uninstall: stop the snow and remove the letitsnow package. The Let It Snow
+# panel runs this in Omarchy's presented terminal, since pacman asks for a password.
+# The plugin itself stays; its panel offers to install the service again.
+set -uo pipefail
+PATH=/usr/bin
+export PATH
+
+bold=$'\033[1m'; dim=$'\033[2m'; reset=$'\033[0m'
+say()  { printf '%s\n' "$*"; }
+note() { printf '%s%s%s\n' "$dim" "$*" "$reset"; }
+ask()  { local answer; read -r -p "$1 [y/N]: " answer; [[ ${answer,,} == y || ${answer,,} == yes ]]; }
+done_() { say ""; read -r -p "Press return to close this window. "; exit "${1:-0}"; }
+trap 'sudo -k 2>/dev/null' EXIT
+
+printf '%sRemove letitsnow%s\n' "$bold" "$reset"
+if ! pacman -Qq letitsnow &>/dev/null; then
+  say "letitsnow is not installed as a package, so there is nothing to remove here."
+  done_ 0
+fi
+cat <<'ABOUT'
+This stops the snow, turns off starting it with the session, and removes the
+letitsnow package with pacman, which asks for your password. Your snow
+settings stay unless you choose to delete them below.
+ABOUT
+ask "Remove letitsnow" || { say "Nothing was changed."; done_ 0; }
+
+/usr/bin/letitsnow stop >/dev/null 2>&1 || true
+systemctl --user disable letitsnow.service >/dev/null 2>&1 || true
+sudo pacman -R letitsnow || { say "pacman did not remove it; the snow is stopped, nothing else changed."; done_ 1; }
+systemctl --user daemon-reload || true
+
+cfg=${XDG_CONFIG_HOME:-$HOME/.config}/letitsnow
+if [[ -d $cfg ]] && ask "Also delete your snow settings ($cfg)"; then
+  rm -rf -- "$cfg" && note "Deleted."
+fi
+say "Removed. The Let It Snow panel offers to install it again."
+done_ 0
