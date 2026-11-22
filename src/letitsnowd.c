@@ -307,9 +307,22 @@ static char *trim(char *s)
 static struct settings read_settings(void)
 {
 	struct settings c = DEFAULTS;
-	FILE *f = fopen(app.cfg_path, "r");
-	if (!f)
+	/* A regular file of settings-file size, opened without blocking: a FIFO
+	 * or a device in its place is ignored rather than waited on. */
+	int fd = open(app.cfg_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0)
 		return c;
+	struct stat st;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size > 65536) {
+		logmsg("ignoring %s: not a regular file of settings size", app.cfg_path);
+		close(fd);
+		return c;
+	}
+	FILE *f = fdopen(fd, "r");
+	if (!f) {
+		close(fd);
+		return c;
+	}
 	char line[512];
 	while (fgets(line, sizeof line, f)) {
 		char *l = trim(line);
@@ -1554,12 +1567,21 @@ static void connect_display(void)
 
 static int take_lock(void)
 {
+	/* The lock lives in the user's own runtime directory and nowhere else: a
+	 * shared directory like /tmp would let another account plant it. */
 	const char *rt = getenv("XDG_RUNTIME_DIR");
+	if (!rt || *rt != '/') {
+		logmsg("XDG_RUNTIME_DIR is not set; letitsnow needs it for its lock");
+		exit(EX_UNAVAILABLE);
+	}
 	char p[PATH_MAX];
-	snprintf(p, sizeof p, "%s/letitsnow-%s.lock", rt && *rt ? rt : "/tmp", app.wl_socket);
-	int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-	if (fd < 0)
-		return -1;
+	snprintf(p, sizeof p, "%s/letitsnow-%s.lock", rt, app.wl_socket);
+	int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+	struct stat st;
+	if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) {
+		logmsg("cannot use %s as the lock file", p);
+		exit(1);
+	}
 	/* `letitsnow status` tests the lock by taking it for an instant, so a
 	 * renderer started during that instant must not take it for another one
 	 * running: retry for a moment before saying so. */

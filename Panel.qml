@@ -238,10 +238,13 @@ Panel {
     onTriggered: root.flush()
   }
 
-  // A change made in a terminal shows here at once.
+  // A change made in a terminal shows here at once. Only watched, never
+  // loaded: the change is the news, and the settings are read by `letitsnow
+  // status`, out of process (a FIFO in its place cannot stall the shell).
   FileView {
     path: root.configPath
     watchChanges: true
+    preload: false
     printErrors: false
     onFileChanged: root.refresh()
   }
@@ -269,6 +272,7 @@ Panel {
   // those two places, not along PATH.
   Process {
     id: findProc
+    environment: root.trustedEnv
     command: ["/usr/bin/sh", "-c", "for c in /usr/bin/letitsnow \"$HOME/.local/bin/letitsnow\"; do [ -x \"$c\" ] && { echo \"$c\"; exit 0; }; done; exit 0"]
     stdout: StdioCollector {
       waitForEnd: true
@@ -282,6 +286,7 @@ Panel {
 
   Process {
     id: statusProc
+    environment: root.trustedEnv
     command: [root.cli, "status", "--json"]
     stdout: StdioCollector {
       waitForEnd: true
@@ -303,6 +308,7 @@ Panel {
 
   Process {
     id: actionProc
+    environment: root.trustedEnv
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
     onRunningChanged: {
@@ -312,15 +318,20 @@ Panel {
     }
   }
 
+  // By absolute path, with PATH pinned to root-owned directories.
+  readonly property var trustedEnv: ({ PATH: "/usr/bin:/usr/share/omarchy/bin" })
+
   Process {
     id: setupProc
-    command: ["omarchy", "launch", "floating", "terminal", "with", "presentation", root.pluginDir + "/bin/letitsnow-setup"]
+    command: ["/usr/bin/omarchy", "launch", "floating", "terminal", "with", "presentation", root.pluginDir + "/bin/letitsnow-setup"]
+    environment: root.trustedEnv
     onExited: root.reprobe()
   }
 
   Process {
     id: uninstallProc
-    command: ["omarchy", "launch", "floating", "terminal", "with", "presentation", root.pluginDir + "/bin/letitsnow-uninstall"]
+    command: ["/usr/bin/omarchy", "launch", "floating", "terminal", "with", "presentation", root.pluginDir + "/bin/letitsnow-uninstall"]
+    environment: root.trustedEnv
     onExited: root.reprobe()
   }
 
