@@ -129,7 +129,8 @@ shown() {
   return "${PIPESTATUS[0]}"
 }
 
-BUILD_NEEDS=(base-devel wayland wayland-protocols libglvnd)
+BUILD_NEEDS=(base-devel wayland wayland-protocols libglvnd bubblewrap)
+SANDBOX_REFUSAL="bubblewrap cannot start a sandbox here (are unprivileged user namespaces disabled?), so nothing was built. The build never runs outside the sandbox."
 missing_tools() { pacman -T -- "$@" 2>/dev/null | paste -sd' ' -; }
 
 pkgver=$(sed -n 's/^pkgver=//p' "$here/packaging/PKGBUILD")
@@ -153,22 +154,16 @@ check_built() {
     --name letitsnow --version "$version"
     --root usr/bin/letitsnow --root usr/lib/letitsnow --root usr/lib/systemd/user/letitsnow.service
     --root usr/share/doc/letitsnow --root usr/share/licenses/letitsnow)
-  if sandbox_works; then shown in_sandbox "$work_dir" "$work_dir" "${check[@]}"
-  else shown "${check[@]}"
-  fi
+  shown in_sandbox "$work_dir" "$work_dir" "${check[@]}"
 }
 
+# The build and the package check only ever run inside the sandbox. If
+# bubblewrap cannot start, nothing is built: there is no unsandboxed fallback.
 build_package() {
+  sandbox_works || { say "$SANDBOX_REFUSAL"; return 1; }
   new_work_dir || { say "Could not create a build directory."; return 1; }
-  if sandbox_works; then
-    shown in_sandbox "$work_dir" "$here/packaging" makepkg --nocolor --noconfirm
-  else
-    ( cd "$here/packaging" &&
-      shown setsid -w env -i PATH=/usr/bin HOME="$work_dir" LANG=C.UTF-8 \
-        XDG_CONFIG_HOME="$here/packaging/sandbox" BUILDDIR="$work_dir/build" \
-        PKGDEST="$work_dir/out" SRCDEST="$work_dir/sources" LOGDEST="$work_dir/build" \
-        setpriv --no-new-privs -- makepkg --nocolor --noconfirm </dev/null )
-  fi || { say "The build did not finish."; return 1; }
+  shown in_sandbox "$work_dir" "$here/packaging" makepkg --nocolor --noconfirm ||
+    { say "The build did not finish."; return 1; }
   find_built || { say "The build did not leave exactly one letitsnow package."; return 1; }
   check_built || { say "The package is not what this checkout builds."; return 1; }
 }
@@ -211,11 +206,7 @@ if [[ -n $missing ]]; then
 else
   note "Everything the build needs is installed."
 fi
-if ! sandbox_works; then
-  pacman -T bubblewrap >/dev/null 2>&1 || run_sudo pacman -S --needed --asdeps bubblewrap
-  sandbox_works ||
-    note "bubblewrap cannot start here; the build runs with no new privileges and a clean environment instead."
-fi
+sandbox_works || { say "$SANDBOX_REFUSAL"; exit 1; }
 
 head2 "Building"
 say "sudo asks for your password now, for pacman at the end. The build cannot use it:"

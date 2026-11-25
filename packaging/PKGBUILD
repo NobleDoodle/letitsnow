@@ -7,7 +7,7 @@
 # was reviewed. The checkout is only read: everything the build makes goes to $srcdir
 # (make O=...), never into the plugin folder the Omarchy shell watches.
 pkgname=letitsnow
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Falling snow on the Hyprland desktop, as a user service"
 arch=('x86_64' 'aarch64')

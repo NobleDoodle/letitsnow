@@ -15,6 +15,17 @@ v_pkg=$(sed -n 's/^pkgver=//p' "$HERE/packaging/PKGBUILD")
 for f in bin/letitsnow bin/letitsnow-setup bin/letitsnow-uninstall; do
   bash -n "$HERE/$f" && ok "bash -n $f" || bad "bash -n $f"
 done
+# The build and package check must only ever run inside bubblewrap: no unsandboxed fallback.
+setup="$HERE/bin/letitsnow-setup"
+if grep -nE '\bmakepkg\b|check\[@\]' "$setup" | grep -v '^[0-9]*: *#' | grep -vE 'in_sandbox|local check=' | grep -q .; then
+  bad "letitsnow-setup runs makepkg or check-package outside in_sandbox"
+elif grep -qE '\bsetpriv\b' "$setup"; then
+  bad "letitsnow-setup still has the setpriv (unsandboxed) build fallback"
+elif ! grep -q 'sandbox_works || { say "\$SANDBOX_REFUSAL"; return 1; }' "$setup"; then
+  bad "build_package does not refuse when bubblewrap cannot start"
+else
+  ok "letitsnow-setup builds only inside the sandbox"
+fi
 python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/packaging/check-package" && ok "check-package parses" || bad "check-package"
 if command -v omarchy > /dev/null; then
   omarchy plugin validate "$HERE" > /dev/null && ok "omarchy plugin validate" || bad "omarchy plugin validate"

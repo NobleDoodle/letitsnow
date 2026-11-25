@@ -26,15 +26,18 @@ omarchy plugin add https://github.com/NobleDoodle/letitsnow --enable
 Then click the snowflake in the bar and choose **Install** (or press `i`).
 Install runs `bin/letitsnow-setup` in Omarchy's terminal, which:
 
-- builds the service from this checkout with makepkg, offline, in a sandbox
-  that cannot use sudo and can only read the checkout
+- builds the service from this checkout with makepkg, offline, in a
+  bubblewrap sandbox that cannot use sudo and can only read the checkout.
+  The build and the package check never run outside it: if bubblewrap cannot
+  start (for example, unprivileged user namespaces are turned off), setup
+  stops before asking for your password and builds nothing
 - checks the package before pacman sees it: only letitsnow's own files, no
   install script, nothing setuid
 - installs it with pacman, which asks for your password
 - offers to start the snow now, and to start it with your session
 
 Nothing else is cloned or downloaded, unless a build tool (`base-devel`,
-`wayland-protocols`) is missing, and setup asks before installing those.
+`wayland-protocols`, `bubblewrap`) is missing, and setup asks before installing those.
 
 ![Let It Snow: the panel, with snow falling over the desktop](preview.png)
 
